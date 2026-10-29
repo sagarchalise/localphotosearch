@@ -1,0 +1,36 @@
+[project]
+name = "localphotosearch"
+version = "0.1.0"
+description = "Local photo search with EmbeddingGemma 2 on OpenVINO"
+readme = "README.md"
+authors = [
+    { name = "Sagar Chalise", email = "schalise@buildchange.org" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "huggingface-hub>=2.3.0",
+    "numpy>=2.5.4",
+    "openvino>=2026.4.1",
+    "pillow>=13.0.0",
+    "pillow-heif>=1.8.1",
+    "pywebview>=6.2.1",
+    "send2trash>=2.1.0",
+    "tokenizers>=0.23.3",
+    "watchdog>=6.0.0",
+]
+
+[project.optional-dependencies]
+# NVIDIA GPUs (CUDA 13 runtime + cuDNN from pip; needs a recent NVIDIA driver)
+cuda = ["onnxruntime-gpu[cuda,cudnn]>=1.31"]
+
+[project.scripts]
+localphotosearch = "localphotosearch:main"
+
+[build-system]
+requires = ["uv_build>=0.13.5,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "onnx>=1.23.2",
+]
