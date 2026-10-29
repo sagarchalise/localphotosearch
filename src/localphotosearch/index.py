@@ -1,4 +1,8 @@
-"""Photo index: incremental folder scan, embedding, SQLite storage and in-memory vector search."""
+"""Photo index: incremental folder scan, embedding, SQLite storage and in-memory vector search.
+
+Photos come from local folders (source "local") or from Google Photos via the Chrome extension
+(source "gphotos", path "gphotos:<mediaKey>", no local file).
+"""
 
 import logging
 import os
@@ -8,6 +12,7 @@ from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +47,21 @@ CREATE TABLE IF NOT EXISTS photos (
     error TEXT
 );
 """
+# Added after the first release; applied to existing databases by _migrate().
+EXTRA_COLUMNS = {
+    "source": "TEXT NOT NULL DEFAULT 'local'",
+    "remote_id": "TEXT",  # Google Photos mediaKey
+    "dedup_key": "TEXT",  # Google Photos dedupKey (used to trash/restore)
+    "location": "TEXT",
+    "trashed": "INTEGER NOT NULL DEFAULT 0",  # moved to Google Photos Trash; kept for undo
+}
+LOCAL, GPHOTOS = "local", "gphotos"
+GPHOTOS_PREFIX = "gphotos:"
+
+
+def google_photos_url(path: str) -> str | None:
+    """photos.google.com URL for a Google Photos item's path, else None."""
+    return f"https://photos.google.com/photo/{path[len(GPHOTOS_PREFIX):]}" if path.startswith(GPHOTOS_PREFIX) else None
 
 
 @dataclass
@@ -122,10 +142,22 @@ class PhotoIndex:
         self.embedder = embedder
         self.search_dim = search_dim
         self.lock = threading.RLock()
-        self.db = sqlite3.connect(data_dir / "index.db", check_same_thread=False)
+        self.db = sqlite3.connect(data_dir / "index.db", check_same_thread=False, timeout=30)
+        self.db.execute("PRAGMA journal_mode=WAL")  # desktop app and extension host may share the db
         self.db.executescript(SCHEMA)
+        self._migrate()
         self._check_model_settings()
         self._load_vectors()
+
+    def _migrate(self) -> None:
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(photos)")}
+        for name, ddl in EXTRA_COLUMNS.items():
+            if name not in columns:
+                self.db.execute(f"ALTER TABLE photos ADD COLUMN {name} {ddl}")
+        self.db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS photos_remote_id ON photos(remote_id) WHERE remote_id IS NOT NULL"
+        )
+        self.db.commit()
 
     # ---- settings -------------------------------------------------------------------------
 
@@ -174,7 +206,9 @@ class PhotoIndex:
         with self.lock:
             known = {
                 path: (pid, size, mtime)
-                for pid, path, size, mtime in self.db.execute("SELECT id, path, size, mtime FROM photos")
+                for pid, path, size, mtime in self.db.execute(
+                    "SELECT id, path, size, mtime FROM photos WHERE source=?", (LOCAL,)
+                )
             }
             seen, todo = set(), []
             for root in self.roots():
@@ -197,7 +231,9 @@ class PhotoIndex:
             queued = {pid for pid, _ in todo}
             todo += [
                 (pid, path)
-                for pid, path in self.db.execute("SELECT id, path FROM photos WHERE vector IS NULL AND error IS NULL")
+                for pid, path in self.db.execute(
+                    "SELECT id, path FROM photos WHERE vector IS NULL AND error IS NULL AND source=?", (LOCAL,)
+                )
                 if pid not in queued and path in seen
             ]
             gone = [(pid, path) for path, (pid, _, _) in known.items() if path not in seen]
@@ -266,10 +302,11 @@ class PhotoIndex:
     def _load_vectors(self) -> None:
         with self.lock:
             rows = self.db.execute(
-                "SELECT id, path, taken, vector FROM photos WHERE vector IS NOT NULL ORDER BY id"
+                "SELECT id, path, taken, vector FROM photos WHERE vector IS NOT NULL AND trashed=0 ORDER BY id"
             ).fetchall()
             self.ids = np.zeros(0, dtype=np.int64)
             self.paths, self.taken = [], []
+            self.remote = np.zeros(0, dtype=bool)
             self.matrix = np.zeros((0, self.search_dim), dtype=np.float32)
             self._row_of: dict[int, int] = {}
             self._pending = rows
@@ -284,6 +321,7 @@ class PhotoIndex:
         self.ids = np.concatenate([self.ids, np.array([r[0] for r in rows], dtype=np.int64)])
         self.paths += [r[1] for r in rows]
         self.taken += [r[2] for r in rows]
+        self.remote = np.concatenate([self.remote, np.array([r[1].startswith(GPHOTOS_PREFIX) for r in rows])])
         self.matrix = np.concatenate([self.matrix, self._truncate(full.astype(np.float32))])
         self._row_of = {int(pid): i for i, pid in enumerate(self.ids)}
 
@@ -296,41 +334,127 @@ class PhotoIndex:
         with self.lock:
             return len(self.ids) + len(self._pending)
 
-    def _top(self, query: np.ndarray, k: int, exclude: int | None = None) -> list[Hit]:
+    def _top(self, query: np.ndarray, k: int, exclude: int | None = None, source: str | None = None) -> list[Hit]:
         with self.lock:
             self._merge_pending()
-            ids, paths, taken, matrix = self.ids, self.paths, self.taken, self.matrix
-        if not len(ids):
+            ids, paths, taken, remote, matrix = self.ids, self.paths, self.taken, self.remote, self.matrix
+        valid = np.ones(len(ids), dtype=bool)
+        if source is not None:
+            valid &= remote if source == GPHOTOS else ~remote
+        if exclude is not None:
+            valid &= ids != exclude
+        candidates = np.flatnonzero(valid)
+        if not len(candidates):
             return []
-        scores = matrix @ self._truncate(query)
-        k = min(k + (exclude is not None), len(scores))
+        scores = matrix[candidates] @ self._truncate(query)
+        k = min(k, len(candidates))
         top = np.argpartition(-scores, k - 1)[:k]
         top = top[np.argsort(-scores[top])]
-        hits = [Hit(int(ids[i]), paths[i], float(scores[i]), taken[i]) for i in top if ids[i] != exclude]
-        return hits[: k - (exclude is not None)]
+        return [
+            Hit(int(ids[candidates[i]]), paths[candidates[i]], float(scores[i]), taken[candidates[i]]) for i in top
+        ]
 
-    def search(self, query: str, k: int = 60) -> list[Hit]:
-        return self._top(self.embedder.embed_texts([query])[0], k)
+    def search(self, query: str, k: int = 60, source: str | None = None) -> list[Hit]:
+        return self._top(self.embedder.embed_texts([query])[0], k, source=source)
 
-    def similar(self, photo_id: int, k: int = 60) -> list[Hit]:
+    def similar(self, photo_id: int, k: int = 60, source: str | None = None) -> list[Hit]:
         with self.lock:
             self._merge_pending()
             row = self._row_of.get(photo_id)
             if row is None:
                 return []
             query = self.matrix[row].copy()
-        return self._top(query, k, exclude=photo_id)
+        return self._top(query, k, exclude=photo_id, source=source)
 
-    def recent(self, k: int = 200) -> list[Hit]:
+    def recent(self, k: int = 200, source: str | None = None) -> list[Hit]:
         """Indexed photos, newest first (EXIF date, else file mtime)."""
         with self.lock:
             rows = self.db.execute(
-                "SELECT id, path, taken FROM photos WHERE vector IS NOT NULL "
+                "SELECT id, path, taken FROM photos WHERE vector IS NOT NULL AND trashed=0 "
+                "AND (? IS NULL OR source=?) "
                 "ORDER BY COALESCE(REPLACE(SUBSTR(taken, 1, 10), ':', '-') || SUBSTR(taken, 11), "
                 "DATETIME(mtime, 'unixepoch')) DESC LIMIT ?",
-                (k,),
+                (source, source, k),
             ).fetchall()
         return [Hit(r[0], r[1], 0.0, r[2]) for r in rows]
+
+    # ---- Google Photos items (added by the Chrome extension) --------------------------------
+
+    def remote_known(self, media_keys: list[str]) -> set[str]:
+        """Media keys that already have a vector (trashed ones count as known)."""
+        if not media_keys:
+            return set()
+        marks = ",".join("?" * len(media_keys))
+        with self.lock:
+            rows = self.db.execute(
+                f"SELECT remote_id FROM photos WHERE vector IS NOT NULL AND remote_id IN ({marks})", media_keys
+            ).fetchall()
+        return {r[0] for r in rows}
+
+    def add_remote(self, items: list[dict]) -> tuple[int, dict[str, str]]:
+        """Embed and store Google Photos items.
+
+        Each item: mediaKey, dedupKey, timestamp (ms), width, height, location, image (PIL).
+        Returns (count stored, {mediaKey: error}).
+        """
+        stored, failed = 0, {}
+        replaced = False  # re-adding an indexed item must not duplicate it in the search matrix
+        stream = self.embedder.embed_stream(iter(items), lambda item: item["image"])
+        try:
+            for item, vec, error in stream:
+                key = item["mediaKey"]
+                if error is not None:
+                    failed[key] = str(error)
+                    continue
+                taken = datetime.fromtimestamp(item["timestamp"] / 1000).strftime("%Y:%m:%d %H:%M:%S")
+                path, blob = f"{GPHOTOS_PREFIX}{key}", vec.astype(np.float16).tobytes()
+                with self.lock:
+                    pid = self.db.execute(
+                        "INSERT INTO photos (path, root, size, mtime, width, height, taken, vector, error, "
+                        "source, remote_id, dedup_key, location, trashed) "
+                        "VALUES (?, ?, 0, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 0) "
+                        "ON CONFLICT(path) DO UPDATE SET vector=excluded.vector, error=NULL, trashed=0, "
+                        "dedup_key=excluded.dedup_key, location=excluded.location RETURNING id",
+                        (path, GPHOTOS, item["timestamp"] / 1000, item.get("width"), item.get("height"), taken, blob,
+                         GPHOTOS, key, item.get("dedupKey"), item.get("location")),
+                    ).fetchone()[0]
+                    if pid in self._row_of or any(row[0] == pid for row in self._pending):
+                        replaced = True
+                    else:
+                        self._pending.append((pid, path, taken, blob))
+                thumb = item["image"].copy()
+                thumb.thumbnail((THUMB_SIZE, THUMB_SIZE), Image.Resampling.BICUBIC)
+                thumb.save(self.thumb_path(pid), "JPEG", quality=82)
+                stored += 1
+        finally:
+            stream.close()
+            with self.lock:
+                self.db.commit()
+            if replaced:
+                self._load_vectors()
+        return stored, failed
+
+    def remote_info(self, photo_ids: list[int]) -> dict[int, dict]:
+        """mediaKey, dedupKey and location for Google Photos items among `photo_ids`."""
+        if not photo_ids:
+            return {}
+        marks = ",".join("?" * len(photo_ids))
+        with self.lock:
+            rows = self.db.execute(
+                f"SELECT id, remote_id, dedup_key, location FROM photos WHERE source=? AND id IN ({marks})",
+                [GPHOTOS, *photo_ids],
+            ).fetchall()
+        return {r[0]: {"mediaKey": r[1], "dedupKey": r[2], "location": r[3]} for r in rows}
+
+    def set_remote_trashed(self, media_keys: list[str], trashed: bool) -> None:
+        """Hide (or bring back) items moved to (or restored from) Google Photos Trash."""
+        if not media_keys:
+            return
+        marks = ",".join("?" * len(media_keys))
+        with self.lock:
+            self.db.execute(f"UPDATE photos SET trashed=? WHERE remote_id IN ({marks})", [int(trashed), *media_keys])
+            self.db.commit()
+        self._load_vectors()
 
     def delete_photos(self, photo_ids: list[int]) -> tuple[list[int], dict[int, str]]:
         """Move photos to the Recycle Bin and drop them from the index.
@@ -341,6 +465,9 @@ class PhotoIndex:
         for photo_id in photo_ids:
             path = self.photo_path(photo_id)
             if path is None:
+                continue
+            if path.startswith(GPHOTOS_PREFIX):
+                failed[photo_id] = "Google Photos item: use Move to Trash in the Chrome side panel"
                 continue
             try:
                 if os.path.exists(path):
@@ -365,7 +492,14 @@ class PhotoIndex:
 
     def stats(self) -> dict:
         with self.lock:
-            total, failed = self.db.execute(
-                "SELECT COUNT(*), COUNT(error) FROM photos"
+            total, failed, gphotos = self.db.execute(
+                "SELECT COUNT(*), COUNT(error), "
+                "SUM(source='gphotos' AND vector IS NOT NULL AND trashed=0) FROM photos"
             ).fetchone()
-        return {"photos": total, "indexed": len(self), "failed": failed, "roots": self.roots()}
+        return {
+            "photos": total,
+            "indexed": len(self),
+            "failed": failed,
+            "google_photos": gphotos or 0,
+            "roots": self.roots(),
+        }

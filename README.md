@@ -54,6 +54,16 @@ uv run --extra cuda python scripts/fetch_test_images.py testimgs
 uv run --extra cuda python scripts/spike.py testimgs --device CUDA --verbose
 ```
 
+## Native messaging host (for browser extensions)
+
+`native_host.py` lets a Chrome extension use the local index and embedder over Chrome Native
+Messaging (stdio, no network port). Nothing ships that uses it today; it was built for a Google
+Photos extension (dropped: Google Photos' own search covered the need) and kept for similar
+integrations. It indexes "remote" photos sent as thumbnails (`source='gphotos'`, path
+`gphotos:<id>`), and supports search, similar, thumbnails and trash/undo flags; local-folder
+scans never touch those rows. The protocol and the registration steps (launcher, host manifest,
+one HKCU registry key) are documented at the top of `native_host.py`.
+
 ## Where things are stored
 
 `%LOCALAPPDATA%\localphotosearch` (override with `LOCALPHOTOSEARCH_DATA`):
@@ -62,6 +72,7 @@ uv run --extra cuda python scripts/spike.py testimgs --device CUDA --verbose
 - `thumbs\`: 256 px JPEG thumbnails
 - `models\`: downloaded ONNX files
 - `cache\openvino\`: compiled GPU/NPU models (makes later launches faster)
+- `native-host.log`: log of the native messaging host, when one is used
 
 ## How it works
 

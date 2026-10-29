@@ -7,6 +7,7 @@ import secrets
 import subprocess
 import threading
 import time
+import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -15,6 +16,7 @@ import webview
 from PIL import Image, ImageOps
 
 from . import config
+from .index import google_photos_url
 from .watcher import FolderWatcher
 
 log = logging.getLogger(__name__)
@@ -144,11 +146,17 @@ class Api:
 
     def open_photo(self, photo_id: int) -> None:
         if path := self._index.photo_path(int(photo_id)):
-            os.startfile(path)
+            if url := google_photos_url(path):
+                webbrowser.open(url)
+            else:
+                os.startfile(path)
 
     def reveal_photo(self, photo_id: int) -> None:
         if path := self._index.photo_path(int(photo_id)):
-            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+            if url := google_photos_url(path):
+                webbrowser.open(url)
+            else:
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
 
     def delete_photos(self, photo_ids: list[int]) -> dict:
         """Move photos to the Recycle Bin and drop them from the index."""
@@ -194,6 +202,8 @@ def make_server(api: Api, token: str) -> ThreadingHTTPServer:
                         return self._send(thumb.read_bytes(), "image/jpeg", cache=True)
                 if index is not None and route == "photo" and rest:
                     if path := index.photo_path(int(rest[0])):
+                        if google_photos_url(path):  # no local file: show the stored thumbnail
+                            return self._send(index.thumb_path(int(rest[0])).read_bytes(), "image/jpeg", cache=True)
                         return self._send(preview_jpeg(path), "image/jpeg", cache=True)
             except (ValueError, OSError) as e:
                 log.warning("GET %s failed: %s", self.path, e)
